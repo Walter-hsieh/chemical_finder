@@ -1,479 +1,271 @@
-# Combined main.py for Streamlit web application
-
-# --- config.py content ---
-# Configuration file for the Chemical Research Agent
-
-# API Keys (replace with your actual keys if needed)
-# For Semantic Scholar, an API key is not strictly necessary for basic searches,
-# but can provide higher rate limits.
-SEMANTIC_SCHOLAR_API_KEY = None # "YOUR_SEMANTIC_SCHOLAR_API_KEY"
-
-# Database Configuration
-# Path to the SQLite database file
-DATABASE_PATH = "data/chemicals.db"
-
-# Search Limits
-# Maximum number of papers to fetch from each source
-MAX_PAPERS_PER_SOURCE = 10
-
-# Caching
-# Time-to-live (TTL) for cached data in seconds (e.g., 3600 seconds = 1 hour)
-CACHE_TTL_SECONDS = 3600
-
-# Other settings
-# Enable/disable SSL verification for requests (set to False only for debugging/development)
-VERIFY_SSL_REQUESTS = True
-
-# Logging level (e.g., logging.INFO, logging.DEBUG)
-LOGGING_LEVEL = "INFO"
-
-# You can add more configuration variables as needed
-# For example, proxy settings, user-agent strings, etc.
-
-
-# --- database.py content ---
+# chemical_finder_app.py (with sorting fix)
+import streamlit as st
+import pandas as pd
 import sqlite3
 import os
+import re
+import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from urllib.parse import quote, urlparse
+from html import unescape
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-def initialize_db():
-    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chemicals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input_name TEXT,
-                matched_name TEXT,
-                cid TEXT,
-                image_url TEXT,
-                searched_at TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_searched_at ON chemicals(searched_at DESC)
-        """)
-        conn.commit()
+# --- 1. Centralized Configuration ---
+class Config:
+    DATABASE_PATH = "data/chemicals.db"
+    MAX_PAPERS_PER_SOURCE = 5
+    CACHE_TTL_SECONDS = 3600
+    VERIFY_SSL_REQUESTS = True
+    REQUEST_TIMEOUT_SECONDS = 10
 
-def save_chemical(input_name, matched_name, cid, image_url):
-    initialize_db()
-    try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
+# --- 2. Centralized Session Management ---
+def create_requests_session():
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.verify = Config.VERIFY_SSL_REQUESTS
+    session.headers.update({'User-Agent': 'ChemicalResearchAgent/1.0'})
+    return session
+
+api_session = create_requests_session()
+
+# --- 3. Database Module ---
+class DatabaseManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._initialize_db()
+
+    def _get_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def _initialize_db(self):
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO chemicals (input_name, matched_name, cid, image_url, searched_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (input_name, matched_name, cid, image_url, datetime.now(timezone.utc)))
+                CREATE TABLE IF NOT EXISTS chemicals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    input_name TEXT, matched_name TEXT, cid TEXT, image_url TEXT, searched_at TEXT
+                )
+            """)
             conn.commit()
-    except Exception as e:
-        print(f"[ERROR] Failed to save chemical: {e}")
 
-def load_history(limit=10):
-    if not os.path.exists(DATABASE_PATH):
-        return []
-    try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
+    def save_chemical(self, input_name, matched_name, cid, image_url):
+        with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT input_name, cid, searched_at FROM chemicals
-                ORDER BY searched_at DESC
-                LIMIT ?
-            """, (limit,))
-            rows = cursor.fetchall()
-        return rows
-    except Exception as e:
-        print(f"[ERROR] Failed to load history: {e}")
-        return []
+            timestamp_str = datetime.now(timezone.utc).isoformat()
+            cursor.execute(
+                "INSERT INTO chemicals (input_name, matched_name, cid, image_url, searched_at) VALUES (?, ?, ?, ?, ?)",
+                (input_name, matched_name, cid, image_url, timestamp_str)
+            )
+            conn.commit()
 
-def clear_history():
-    if not os.path.exists(DATABASE_PATH):
-        return
-    try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
+    def load_history(self, limit=10):
+        with self._get_connection() as conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT input_name, cid, searched_at FROM chemicals ORDER BY searched_at DESC LIMIT ?", (limit,))
+                return cursor.fetchall()
+            except sqlite3.OperationalError:
+                return []
+
+    def clear_history(self):
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM chemicals")
             conn.commit()
-    except Exception as e:
-        print(f"[ERROR] Failed to clear history: {e}")
 
-
-# --- chemical_lookup.py content ---
-import requests
-import urllib3
-import logging
-from urllib.parse import quote
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Disable SSL warnings in dev (not recommended in prod)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Use a session with retry logic
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
-
-session = requests.Session()
-retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retries)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-
-def fetch_pubchem_image(name_or_cas):
-    base_url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
-    try:
-        cid_resp = session.get(f"{base_url}/compound/name/{name_or_cas}/cids/JSON", timeout=10)
-        cid_resp.raise_for_status()
-    except requests.exceptions.SSLError:
-        logger.warning("SSL verification failed. Retrying with verify=False...")
+# --- 4. API Client Modules ---
+class ChemicalFinder:
+    def fetch_pubchem(self, name):
+        base_url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
         try:
-            cid_resp = requests.get(f"{base_url}/compound/name/{name_or_cas}/cids/JSON", verify=False, timeout=10)
-            cid_resp.raise_for_status()
-        except Exception as e:
-            logger.error(f"PubChem CID fetch failed after retry: {e}")
-            return None, None, None, None
-    except requests.exceptions.HTTPError as http_err:
-        logger.warning(f"PubChem returned HTTP error: {http_err}")
-        return None, None, None, None
-    except Exception as e:
-        logger.error(f"PubChem CID fetch failed: {e}")
-        return None, None, None, None
+            cid_resp = api_session.get(f"{base_url}/compound/name/{name}/cids/JSON", timeout=Config.REQUEST_TIMEOUT_SECONDS)
+            if cid_resp.status_code != 200: return None
+            cid = cid_resp.json().get("IdentifierList", {}).get("CID", [])[0]
+            
+            name_resp = api_session.get(f"{base_url}/compound/cid/{cid}/property/IUPACName/JSON", timeout=Config.REQUEST_TIMEOUT_SECONDS)
+            props = name_resp.json().get("PropertyTable", {}).get("Properties", [])
+            matched_name = props[0].get("IUPACName", name) if props else name
+            
+            image_url = f"https://cactus.nci.nih.gov/chemical/structure/{quote(matched_name)}/image"
+            return {"cid": str(cid), "image_url": image_url, "source": "PubChem", "matched_name": matched_name}
+        except (requests.RequestException, IndexError, KeyError):
+            return None
 
-    cids = cid_resp.json().get("IdentifierList", {}).get("CID", [])
-    if not cids:
-        logger.info("PubChem: No CID found.")
-        return None, None, None, None
-    cid = cids[0]
-
-    try:
-        name_resp = session.get(f"{base_url}/compound/cid/{cid}/property/IUPACName/JSON", timeout=10)
-        name_resp.raise_for_status()
-        props = name_resp.json().get("PropertyTable", {}).get("Properties", [])
-        matched_name = props[0].get("IUPACName", name_or_cas) if props else name_or_cas
-    except Exception:
-        matched_name = name_or_cas
-
-    encoded_name = quote(matched_name)
-    image_url = f"https://cactus.nci.nih.gov/chemical/structure/{encoded_name}/image"
-
-    return cid, image_url, "PubChem (Cactus)", matched_name
-
-def fetch_cactus_image(name_or_cas):
-    encoded_name = quote(name_or_cas)
-    image_url = f"https://cactus.nci.nih.gov/chemical/structure/{encoded_name}/image"
-    try:
-        resp = session.head(image_url, timeout=5)
-        if resp.status_code == 200:
-            return None, image_url, "Cactus", name_or_cas
-        else:
-            logger.info(f"Cactus returned status {resp.status_code} for {name_or_cas}")
-            return None, None, None, None
-    except Exception as e:
-        logger.error(f"Cactus request failed: {e}")
-        return None, None, None, None
-
-def fetch_wikidata(name_or_cas):
-    search_url = "https://www.wikidata.org/w/api.php"
-    params = {
-        "action": "wbsearchentities",
-        "search": name_or_cas,
-        "language": "en",
-        "format": "json",
-        "limit": 1,
-        "type": "item"
-    }
-    try:
-        resp = session.get(search_url, params=params, timeout=10)
-        resp.raise_for_status()
-        results = resp.json().get("search", [])
-        if results:
-            entity = results[0]
-            matched_name = entity.get("label", name_or_cas)
-            wikidata_url = f"https://www.wikidata.org/wiki/{entity.get('id')}"
-            return None, wikidata_url, "Wikidata", matched_name
-        else:
-            logger.info("Wikidata: No search results.")
-            return None, None, None, None
-    except Exception as e:
-        logger.error(f"Wikidata fetch failed: {e}")
-        return None, None, None, None
-
-def fetch_chemical_info(name_or_cas):
-    cid, image_url, source, matched_name = fetch_pubchem_image(name_or_cas)
-    if cid or image_url:
-        return cid, image_url, source, matched_name
-
-    cid, image_url, source, matched_name = fetch_cactus_image(name_or_cas)
-    if image_url:
-        return cid, image_url, source, matched_name
-
-    cid, image_url, source, matched_name = fetch_wikidata(name_or_cas)
-    if image_url:
-        return cid, image_url, source, matched_name
-
-    return None, None, None, None
-
-
-# --- paper_search.py content ---
-import urllib.parse
-import xml.etree.ElementTree as ET
-import re
-from html import unescape
-from requests.exceptions import SSLError, RequestException
-
-# logging is already configured above
-
-# VERIFY_SSL is replaced by VERIFY_SSL_REQUESTS from config.py
-MAX_RETRIES = 3 # Define MAX_RETRIES for paper_search context
-
-def safe_get(url, timeout=10, verify=VERIFY_SSL_REQUESTS):
-    try:
-        return requests.get(url, timeout=timeout, verify=verify)
-    except SSLError:
-        if verify:
-            logger.warning(f"SSL failed for {url}. Retrying with verify=False...")
-            return safe_get(url, timeout=timeout, verify=False)
-        raise
-
-def clean_abstract(raw_abstract):
-    if not raw_abstract:
-        return "No abstract available."
-    clean = re.sub('<[^<]+?>', '', raw_abstract)
-    return unescape(clean).strip()
-
-def parse_semantic_response(response):
-    data = response.json().get("data", [])
-    papers = []
-    for paper in data:
-        authors = ", ".join([a.get("name", "N/A") for a in paper.get("authors", [])])
-        pdf_url = paper.get("openAccessPdf", {}).get("url") if paper.get("openAccessPdf") else None
-        papers.append({
-            "title": paper.get("title", ""),
-            "authors": authors,
-            "year": paper.get("year", "N/A"),
-            "url": paper.get("url", ""),
-            "abstract": paper.get("abstract", "No abstract available."),
-            "pdf_url": pdf_url
-        })
-    return papers
-
-def search_semantic_scholar(query, limit=5):
-    if not query.strip():
-        return []
-    encoded_query = urllib.parse.quote(query)
-    url = (
-        f"https://api.semanticscholar.org/graph/v1/paper/search?"
-        f"query={encoded_query}&limit={limit}&fields=title,authors,year,url,abstract,externalIds,openAccessPdf"
-    )
-    logger.debug(f"Semantic Scholar: {url}")
-    for _ in range(MAX_RETRIES): # Using MAX_RETRIES from paper_search.py
+    def fetch_cactus(self, name):
+        image_url = f"https://cactus.nci.nih.gov/chemical/structure/{quote(name)}/image"
         try:
-            response = safe_get(url)
-            if response.status_code == 200:
-                return parse_semantic_response(response)[:limit]
-        except Exception as e:
-            logger.error(f"Semantic Scholar error: {e}")
-    return []
+            resp = api_session.head(image_url, timeout=Config.REQUEST_TIMEOUT_SECONDS)
+            if resp.status_code == 200:
+                return {"cid": None, "image_url": image_url, "source": "Cactus", "matched_name": name}
+        except requests.RequestException:
+            return None
+        return None
 
-def search_crossref(query, limit=5):
-    if not query.strip():
-        return []
-    encoded_query = urllib.parse.quote(query)
-    url = f"https://api.crossref.org/works?query={encoded_query}&rows={limit}"
-    logger.debug(f"CrossRef: {url}")
-    try:
-        response = safe_get(url)
-        response.raise_for_status()
-    except Exception as e:
-        logger.error(f"CrossRef error: {e}")
-        return []
+    def find_best_info(self, name):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_to_source = {executor.submit(self.fetch_pubchem, name): "PubChem", executor.submit(self.fetch_cactus, name): "Cactus"}
+            results = {}
+            for future in as_completed(future_to_source):
+                source = future_to_source[future]
+                result = future.result()
+                if result: results[source] = result
+            return results.get("PubChem") or results.get("Cactus")
 
-    items = response.json().get("message", {}).get("items", [])
-    results = []
-    for item in items:
-        authors = [f"{a.get('given', '')} {a.get('family', '')}".strip() for a in item.get("author", [])]
-        authors_str = ", ".join(authors) if authors else "N/A"
-        pdf_url = next((link.get("URL") for link in item.get("link", []) if link.get("content-type") == "application/pdf"), None)
-        results.append({
-            "title": item.get("title", [""])[0],
-            "authors": authors_str,
-            "year": item.get("issued", {}).get("date-parts", [[None]])[0][0],
-            "url": item.get("URL", ""),
-            "abstract": clean_abstract(item.get("abstract")),
-            "pdf_url": pdf_url
-        })
-    return results[:limit]
+class PaperFinder:
+    def _clean_abstract(self, raw_abstract):
+        if not raw_abstract: return "No abstract available."
+        clean = re.sub('<[^<]+?>', '', raw_abstract)
+        return unescape(clean).strip()
 
-def search_arxiv(query, limit=5):
-    if not query.strip():
-        return []
-    base_url = f"http://export.arxiv.org/api/query?search_query=all:{urllib.parse.quote(query)}&start=0&max_results={limit}"
-    logger.debug(f"arXiv: {base_url}")
-    try:
-        response = safe_get(base_url)
-        response.raise_for_status()
-    except Exception as e:
-        logger.error(f"arXiv error: {e}")
-        return []
+    def search_semantic_scholar(self, query, limit):
+        url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={quote(query)}&limit={limit}&fields=title,authors,year,url,abstract,openAccessPdf"
+        try:
+            response = api_session.get(url, timeout=Config.REQUEST_TIMEOUT_SECONDS)
+            if response.status_code != 200: return []
+            data = response.json().get("data", [])
+            papers = []
+            for paper in data:
+                pdf_url = paper.get("openAccessPdf", {}).get("url") if paper.get("openAccessPdf") else None
+                papers.append({
+                    "title": paper.get("title", ""), "authors": ", ".join([a.get("name", "N/A") for a in paper.get("authors", [])]),
+                    "year": paper.get("year", None), "url": paper.get("url", ""), "abstract": paper.get("abstract", "No abstract."), "pdf_url": pdf_url
+                })
+            return papers
+        except requests.RequestException: return []
 
-    entries = []
-    try:
-        root = ET.fromstring(response.text)
-        ns = {'atom': 'http://www.w3.org/2005/Atom'}
-        for entry in root.findall("atom:entry", ns):
-            title = entry.find("atom:title", ns).text.strip()
-            abstract = entry.find("atom:summary", ns).text.strip()
-            url = entry.find("atom:id", ns).text
-            year = entry.find("atom:published", ns).text[:4]
-            arxiv_id = url.split('/abs/')[-1]
-            pdf_url = f"http://arxiv.org/pdf/{arxiv_id}.pdf"
-            authors = [author.text for author in entry.findall("atom:author/atom:name", ns)]
-            authors_str = ", ".join(authors) or "N/A"
-            entries.append({
-                "title": title,
-                "authors": authors_str,
-                "year": year,
-                "url": url,
-                "abstract": abstract,
-                "pdf_url": pdf_url
-            })
-    except Exception as e:
-        logger.error(f"Failed to parse arXiv response: {e}")
-        return []
+    def search_crossref(self, query, limit):
+        url = f"https://api.crossref.org/works?query={quote(query)}&rows={limit}"
+        try:
+            response = api_session.get(url, timeout=Config.REQUEST_TIMEOUT_SECONDS)
+            if response.status_code != 200: return []
+            items = response.json().get("message", {}).get("items", [])
+            results = []
+            for item in items:
+                authors_str = ", ".join([f"{a.get('given', '')} {a.get('family', '')}".strip() for a in item.get("author", [])])
+                pdf_url = next((link.get("URL") for link in item.get("link", []) if link.get("content-type") == "application/pdf"), None)
+                results.append({
+                    "title": item.get("title", [""])[0], "authors": authors_str, "year": item.get("issued", {}).get("date-parts", [[None]])[0][0],
+                    "url": item.get("URL", ""), "abstract": self._clean_abstract(item.get("abstract")), "pdf_url": pdf_url
+                })
+            return results
+        except requests.RequestException: return []
 
-    return entries[:limit]
+    def search_arxiv(self, query, limit):
+        url = f"http://export.arxiv.org/api/query?search_query=all:{quote(query)}&start=0&max_results={limit}"
+        try:
+            response = api_session.get(url, timeout=Config.REQUEST_TIMEOUT_SECONDS)
+            if response.status_code != 200: return []
+            root = ET.fromstring(response.text)
+            ns = {'atom': 'http://www.w3.org/2005/Atom'}
+            entries = []
+            for entry in root.findall("atom:entry", ns):
+                arxiv_id = urlparse(entry.find("atom:id", ns).text).path.strip("/abs/")
+                entries.append({
+                    "title": entry.find("atom:title", ns).text.strip(), "authors": ", ".join([a.text for a in entry.findall("atom:author/atom:name", ns)]),
+                    "year": int(entry.find("atom:published", ns).text[:4]), "url": entry.find("atom:id", ns).text,
+                    "abstract": entry.find("atom:summary", ns).text.strip(), "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+                })
+            return entries
+        except (requests.RequestException, ET.ParseError): return []
 
-def search_papers(query, limit=10):
-    all_papers = []
-    for source, func in [
-        ("Semantic Scholar", search_semantic_scholar),
-        ("CrossRef", search_crossref),
-        ("arXiv", search_arxiv)
-    ]:
-        papers = func(query, limit=limit - len(all_papers))
-        if papers:
-            all_papers.extend(papers)
-            if len(all_papers) >= limit:
-                return all_papers[:limit], "Multiple Sources"
-    return all_papers, "Multiple Sources" if all_papers else "None"
+    def search_all(self, query, limit=10):
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_searches = {
+                executor.submit(self.search_semantic_scholar, query, limit): "Semantic Scholar",
+                executor.submit(self.search_crossref, query, limit): "CrossRef",
+                executor.submit(self.search_arxiv, query, limit): "arXiv"
+            }
+            all_papers = []
+            for future in as_completed(future_searches):
+                papers = future.result()
+                if papers: all_papers.extend(papers)
+            
+            unique_papers = {p['title'].lower().strip(): p for p in all_papers}.values()
+            # --- FIX: Use 'or 0' to handle None values for 'year' during sorting ---
+            return sorted(list(unique_papers), key=lambda x: x.get('year') or 0, reverse=True)[:limit]
 
-
-# --- utils.py content ---
-# You can add any helper functions here
-
-
-# --- app.py content (main Streamlit application logic) ---
-import streamlit as st
-import pandas as pd # Already imported
-# from chemical_lookup import fetch_chemical_info # Removed, now in same file
-# from paper_search import search_papers # Removed, now in same file
-# from database import save_chemical, load_history, clear_history # Removed, now in same file
-# from datetime import datetime # Already imported
-# from urllib.parse import quote # Already imported
-# import requests # Already imported
-
-st.set_page_config(page_title="Chemical Research Agent", layout="centered")
+# --- 5. Main Streamlit Application ---
+st.set_page_config(page_title="Chemical Research Agent", layout="wide")
 st.title("🧪 Chemical Research Agent")
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS) # Using CACHE_TTL_SECONDS from config
+# Initialize managers
+db = DatabaseManager(Config.DATABASE_PATH)
+chemical_finder = ChemicalFinder()
+paper_finder = PaperFinder()
+
+@st.cache_data(ttl=Config.CACHE_TTL_SECONDS)
+def get_chemical_info(name):
+    return chemical_finder.find_best_info(name)
+
+@st.cache_data(ttl=Config.CACHE_TTL_SECONDS)
 def get_papers(query):
-    return search_papers(query)
+    return paper_finder.search_all(query)
 
-chemical_input = st.text_input("Enter chemical name or CAS number:")
+# --- Streamlit UI ---
+chemical_input = st.text_input("Enter chemical name, CAS number, or SMILES:", key="chem_input")
 
-if st.button("🔍 Search"):
-    if not chemical_input.strip():
-        st.warning("Please enter a valid chemical name.")
-    else:
-        with st.spinner("Fetching chemical info and related papers..."):
-            cid, image_url, source, matched_name = fetch_chemical_info(chemical_input)
-            search_term = matched_name or chemical_input
-
-            if cid or image_url:
-                if image_url:
-                    st.image(image_url, caption=f"{search_term} (Source: {source})", use_container_width=False)
-                if cid:
-                    st.success(f"CID: {cid}")
-
-                if matched_name and matched_name.lower() != chemical_input.lower():
-                    st.info(f"Matched to: `{matched_name}`")
-
-                save_chemical(chemical_input, matched_name or "", cid or "N/A", image_url or "")
-
-                st.subheader("📚 Related Papers")
-                st.caption(f"Searching papers for: `{search_term}`")
-
-                try:
-                    papers, source_used = get_papers(search_term)
-                    source_links = {
-                        "Semantic Scholar": "https://www.semanticscholar.org/",
-                        "CrossRef": "https://search.crossref.org/",
-                        "arXiv": "https://arxiv.org/"
-                    }
-                    st.markdown(f"✅ Showing results from [{source_used}]({source_links.get(source_used, '#')})")
-
-                except Exception as e:
-                    st.error("❌ Paper search failed. Please check your internet connection or try again later.")
-                    st.exception(e)
-                    papers = []
-
-                if papers:
-                    paper_list = []
-                    for p in papers:
-                        p['source'] = source_used  # add source to paper dict
-                        st.markdown(f"**{p['title']}** ({p['year']})")
-                        st.markdown(f"👨‍🔬 *{p['authors']}*")
-                        st.markdown(f"[🔗 Read more]({p['url']})")
-                        st.markdown(p.get('abstract', '_No abstract available._'))
-
-                        pdf_url = p.get("pdf_url")
-                        if pdf_url:
-                            st.markdown(f"[📄 Download PDF]({pdf_url})")
-
-                        st.markdown("---")
-                        paper_list.append(p)
-
-                    df = pd.DataFrame(paper_list)
-                    csv = df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        label="⬇️ Download Papers as CSV",
-                        data=csv,
-                        file_name=f"papers_{search_term.replace(' ', '_')}.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.warning("No related papers found. Try different keywords, synonyms, or identifiers.")
+if st.button("🔍 Search", key="search_button"):
+    if chemical_input:
+        with st.spinner("Concurrently searching databases and literature..."):
+            chem_info = get_chemical_info(chemical_input)
+            
+            if chem_info:
+                search_term = chem_info["matched_name"]
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.image(chem_info["image_url"], caption=f"Source: {chem_info['source']}", use_container_width=True)
+                with col2:
+                    st.subheader(search_term)
+                    if chem_info["cid"]: st.success(f"PubChem CID: {chem_info['cid']}")
+                    if search_term.lower() != chemical_input.lower(): st.info(f"Input was matched to: `{search_term}`")
+                
+                db.save_chemical(chemical_input, search_term, chem_info["cid"] or "N/A", chem_info["image_url"])
             else:
-                st.warning("🔍 Compound not found in structured chemical databases.")
-                query_encoded = quote(chemical_input)
-                pubchem_url = f"https://pubchem.ncbi.nlm.nih.gov/#query={query_encoded}"
-                wikidata_url = f"https://www.wikidata.org/w/index.php?search={query_encoded}"
+                st.warning("Compound not found in databases. Searching papers with the provided input.")
+                search_term = chemical_input
 
-                st.info(
-                    f"""⚠️ This compound may still exist in scientific literature, but no structure or CID was found.
+            st.subheader(f"📚 Related Papers for `{search_term}`")
+            papers = get_papers(search_term)
+            
+            if papers:
+                for p in papers:
+                    st.markdown(f"**{p['title']}** ({p.get('year', 'N/A')})")
+                    st.markdown(f"👨‍🔬 *{p.get('authors', 'N/A')}*")
+                    if p.get('url'): st.markdown(f"[🔗 Read more]({p['url']})")
+                    if p.get('pdf_url'): st.markdown(f"[📄 Download PDF]({p['pdf_url']})")
+                    with st.expander("View Abstract"):
+                        st.markdown(p.get('abstract', '_No abstract available._'))
+                    st.markdown("---")
+                
+                df = pd.DataFrame(papers)
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button(label="⬇️ Download Papers as CSV", data=csv, file_name=f"papers_{search_term.replace(' ', '_')}.csv", mime="text/csv")
+            else:
+                st.warning("No related papers found.")
 
-💡 Try entering a more precise identifier such as:
-- CAS number (e.g. `50-00-0`)
-- IUPAC name (e.g. `methanal`)
-- SMILES notation (e.g. `C=O`)
-
-You can also try searching manually:
-- 🔬 [Search on PubChem]({pubchem_url})
-- 🧠 [Search on Wikidata]({wikidata_url})"""
-                )
-
+# History display
 st.divider()
-st.markdown("### 🔁 Recent Search History")
-
+st.subheader("🔁 Recent Search History")
 if st.button("🗑️ Clear History"):
-    clear_history()
-    st.success("Search history cleared!")
+    db.clear_history()
+    st.success("History cleared!")
+    st.rerun()
 
-history = load_history(limit=10)
+history = db.load_history()
 if history:
-    for name, cid, time in history:
-        time_str = datetime.fromisoformat(time).strftime("%Y-%m-%d %H:%M")
-        st.markdown(f"🧪 **{name}** — CID: `{cid}`  _(at {time_str})_")
+    for name, cid, time_str in history:
+        try:
+            dt_obj = datetime.fromisoformat(time_str)
+            formatted_time = dt_obj.strftime("%Y-%m-%d %H:%M UTC")
+            st.write(f"- **{name}** (CID: {cid}) - Searched on {formatted_time}")
+        except (ValueError, TypeError):
+            st.write(f"- **{name}** (CID: {cid}) - Invalid timestamp in DB")
 else:
-    st.info("No search history yet.")
+    st.info("No searches yet.")
